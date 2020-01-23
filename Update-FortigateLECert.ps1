@@ -57,6 +57,17 @@ if($cert){
             Write-Error "Updating CA failed: $($out.Error)"
         }
 
+        # This gets ran twice - why you ask? No idea. Makes cert blank if only ran once ¯\_(ツ)_/¯
+        Write-Output "Updating the LetsEncrypt Certificate on the FGT"
+        $out = Invoke-SSHCommand -SessionId $session.sessionid "config vpn certificate local
+        edit `"LetsEncrypt`"
+        set certificate `"$(gc $cert.CertFile -Raw)`"
+        set private-key `"$(gc $cert.KeyFile -Raw)`"
+        end
+        "
+        if($out.ExitStatus -ne 0){
+            Write-Error "Updating LE certificate failed: $($out.Error)"
+        }
         Write-Output "Updating the LetsEncrypt Certificate on the FGT"
         $out = Invoke-SSHCommand -SessionId $session.sessionid "config vpn certificate local
         edit `"LetsEncrypt`"
