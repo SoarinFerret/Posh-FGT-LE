@@ -25,7 +25,9 @@ Param(
     [string]$Username,
     [Parameter(ParameterSetName = "PlainTextPassword")]
     [String]$Password,
-    [String]$MainDomain
+    [String]$MainDomain,
+    [Switch]$ForceRenew,
+    [Switch]$UseExisting
 )
 
 function Use-SelfSignedCerts {
@@ -170,7 +172,15 @@ function Update-FgtSslVpnCert{
 Import-Module Posh-Acme
 
 Write-Output "Starting Certificate Renewal"
-$cert = Submit-Renewal -MainDomain $MainDomain
+if($UseExisting){
+    $cert = Get-PACertificate -MainDomain $MainDomain
+}else{
+    $splat = @{
+        MainDomain = $MainDomain
+    }
+    if($ForceRenew){$splat.add("Force",$true)}
+    $cert = Submit-Renewal @splat
+}
 if($cert){
     Write-Output "...Renewal Complete!"
 
