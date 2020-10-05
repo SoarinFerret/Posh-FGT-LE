@@ -12,9 +12,6 @@ This script uses the Posh-Acme module to RENEW a LetsEncrypt certificate, and th
 This requires Posh-Acme to be preconfigured. The easiest way to do so is with the following command:
     New-PACertificate -Domain fg.example.com,fgt.example.com,vpn.example.com -AcceptTOS -Contact me@example.com -DnsPlugin Cloudflare -PluginArgs @{CFAuthEmail="me@example.com";CFAuthKey='xxx'}
 
-This can only be ran on a Windows host until Posh-SSH becomes cross-platform. Look at the below link for more details:
-    https://github.com/darkoperator/Posh-SSH/issues/130
-
 .LINK
 https://github.com/SoarinFerret/Posh-FGT-LE
 
@@ -31,8 +28,145 @@ Param(
     [String]$MainDomain
 )
 
+function Use-SelfSignedCerts {
+    if($PSEdition -ne "Core"){
+        add-type @"
+            using System.Net;
+            using System.Security.Cryptography.X509Certificates;
+            public class PolicyCert : ICertificatePolicy {
+                public PolicyCert() {}
+                public bool CheckValidationResult(
+                    ServicePoint sPoint, X509Certificate cert,
+                    WebRequest wRequest, int certProb) {
+                    return true;
+                }
+            }
+"@
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object PolicyCert
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;
+    }else{
+        Write-Warning -Message "Function not supported in PSCore. Just use the '-SkipCertificateCheck' flag"
+    }
+}
 
-Import-WinModule Posh-SSH
+function Connect-Fortigate {
+    Param(
+        $Fortigate,
+        $Credential
+    )
+
+    $postParams = @{username=$Credential.UserName;secretkey=$Credential.GetNetworkCredential().Password}
+    try{
+        Write-Verbose "Authenticating to 'https://$Fortigate/logincheck' with username: $($Credential.UserName)"
+
+        #splat arguments
+        $splat = @{
+            Uri = "https://$Fortigate/logincheck";
+            SessionVariable = "session";
+            Method = 'POST';
+            Body = $postParams
+        }
+        if($PSEdition -eq "Core"){$splat.Add("SkipCertificateCheck",$true)}
+
+        $authRequest = Invoke-WebRequest @splat
+    }catch{
+        throw "Failed to authenticate to Fortigate with error: `n`t$_"
+    }
+    Write-Verbose "Authentication successful!"
+    $csrftoken = ($authRequest.Headers['Set-Cookie'] | where {$_ -like "ccsrftoken=*"}).split('"')[1]
+
+    Set-Variable -Scope Global -Name "FgtServer" -Value $Fortigate
+    Set-Variable -Scope Global -Name "FgtSession" -Value $session
+    Set-Variable -Scope Global -Name "FgtCSRFToken" -Value $csrftoken
+}
+
+function Invoke-FgtRestMethod {
+    Param(
+        $Endpoint,
+        [ValidateSet("Default","Delete","Get","Head","Merge","Options","Patch","Post","Put","Trace")]
+        $Method = "Get",
+        $Body = $null
+    )
+
+    Write-Verbose "Building Headers"
+    $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+    $headers.Add('Accept','application/json')
+    $headers.Add('Content-Type','application/x-www-form-urlencoded')
+    # Add csrf cookie
+    $headers.Add('X-CSRFTOKEN',$FgtCSRFToken)
+
+    $splat = @{
+        Headers = $headers;
+        Uri = "https://$FgtServer/api/v2/$($Endpoint.TrimStart('/'))";
+        WebSession = $FgtSession;
+        Method = $Method;
+        Body = $body | ConvertTo-Json
+    }
+    if($PSEdition -eq "Core"){$splat.Add("SkipCertificateCheck",$true)}
+    return Invoke-RestMethod @splat
+}
+
+function Disconnect-Fortigate {
+    Write-Verbose "Building Headers"
+    $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+    $headers.Add('Accept','application/json')
+    $headers.Add('Content-Type','application/x-www-form-urlencoded')
+    # Add csrf cookie
+    $headers.Add('X-CSRFTOKEN',$FgtCSRFToken)
+    
+    # logout
+    $splat = @{
+        Headers = $headers;
+        Uri = "https://$FgtServer/logout";
+        WebSession = $fgtSession;
+        Method = "GET"
+    }
+    if($PSEdition -eq "Core"){$splat.Add("SkipCertificateCheck",$true)}
+    $logoutRequest = Invoke-RestMethod @splat
+
+    Remove-Variable -Scope Global -Name "FgtServer"
+    Remove-Variable -Scope Global -Name "FgtSession" 
+    Remove-Variable -Scope Global -Name "FgtCSRFToken"
+    return $logoutRequest
+}
+
+function Upload-FgtCertificate {
+    Param(
+        $CertificatePath,
+        $CertName,
+        $PfxPassword
+    )
+    $newCertParams = @{
+        type = 'pkcs12'
+        certname=$CertName
+        password=[PSCredential]::new(0, $PfxPassword).GetNetworkCredential().Password
+        scope='global'
+        file_content = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($CertificatePath))
+    }
+    Write-Verbose "Uploading Certificate"
+    try{
+        Invoke-FgtRestMethod -Endpoint "/monitor/vpn-certificate/local/import/" -Body $newCertParams -Method "Post"
+    }catch{
+        throw "Failed to upload certificate with error:`n`t$_"
+    }
+}
+
+function Update-FgtAdminCert {
+    Param(
+        $CertName
+    )
+    $body = @{'admin-server-cert' = $CertName}
+    Invoke-FgtRestMethod -Endpoint "/cmdb/system/global" -Body $body -Method "Put"
+}
+
+function Update-FgtSslVpnCert{
+    Param(
+        $CertName
+    )
+    $body = @{'servercert' = $CertName}
+    Invoke-FgtRestMethod -Endpoint "/cmdb/vpn.ssl/settings" -Body $body -Method "Put"
+}
+
 Import-Module Posh-Acme
 
 Write-Output "Starting Certificate Renewal"
@@ -44,78 +178,21 @@ if($cert){
         Write-Warning "You shouldn't use plaintext passwords on the commandline"
         $Credential = New-Credential -Username $env:FGT_USER -Password $env:FGT_PASS
     }
-    $session = New-SSHSession -ComputerName $Fortigate -Credential $Credential -AcceptKey
 
-    if($session.Connected){
-        Write-Output "Updating the CA on the FGT"
-        $out = Invoke-SSHCommand -SessionId $session.sessionid -Command "config vpn certificate ca
-        edit `"LetsEncryptCA`"
-        set ca `"$(gc $cert.ChainFile -Raw)`"
-        end
-        "
-        if($out.ExitStatus -ne 0){
-            Write-Error "Updating CA failed: $($out.Error)"
-        }
+    $certname = "LetsEncrypt_$(get-date -Format 'yyyy-MM-dd')"
 
-        # This gets ran twice - why you ask? No idea. Makes cert blank if only ran once ¯\_(ツ)_/¯
-        Write-Output "Updating the LetsEncrypt Certificate on the FGT"
-        $out = Invoke-SSHCommand -SessionId $session.sessionid "config vpn certificate local
-        edit `"LetsEncrypt`"
-        set certificate `"$(gc $cert.CertFile -Raw)`"
-        set private-key `"$(gc $cert.KeyFile -Raw)`"
-        end
-        "
-        if($out.ExitStatus -ne 0){
-            Write-Error "Updating LE certificate failed: $($out.Error)"
-        }
-        Write-Output "Updating the LetsEncrypt Certificate on the FGT"
-        $out = Invoke-SSHCommand -SessionId $session.sessionid "config vpn certificate local
-        edit `"LetsEncrypt`"
-        set certificate `"$(gc $cert.CertFile -Raw)`"
-        set private-key `"$(gc $cert.KeyFile -Raw)`"
-        end
-        "
-        if($out.ExitStatus -ne 0){
-            Write-Error "Updating LE certificate failed: $($out.Error)"
-        }
-        
-        Write-Output "Updating the Admin certificate on the FGT"
-        $out = Invoke-SSHCommand -SessionId $session.sessionid -Command "config system global
-        unset admin-server-cert
-        end
-        "
-        if($out.ExitStatus -ne 0){
-            Write-Error "Updating the admin certificate failed: $($out.Error)"
-        }
-        $out = Invoke-SSHCommand -SessionId $session.sessionid -Command "config system global
-        set admin-server-cert `"LetsEncrypt`"
-        end
-        "
-        if($out.ExitStatus -ne 0){
-            Write-Error "Updating the admin certificate failed: $($out.Error)"
-        }
+    Connect-Fortigate -Fortigate $Fortigate -Credential $Credential
+    Write-Output "Updating the LetsEncrypt Certificate on the FGT"
+    Upload-FgtCertificate -CertificatePath $cert.PfxFullChain -CertName $certname -PfxPassword ("poshacme" | ConvertTo-SecureString -AsPlainText -Force)
+    Write-Output "Updating the Admin certificate on the FGT"
+    ## this command fails every first time with "The response ended prematurely" - no idea why, but it works, so I don't really care
+    try{
+        Update-FgtAdminCert -CertName $certname
+    }catch{}
+    Write-Output "Updating the SSLVPN certificate on the FGT"
+    Update-FgtSslVpnCert -CertName $certname
+    Disconnect-Fortigate
 
-        Write-Output "Updating the SSLVPN certificate on the FGT"
-        $out = Invoke-SSHCommand -SessionId $session.sessionid -Command "config vpn ssl settings
-        unset servercert
-        end
-        "
-        if($out.ExitStatus -ne 0){
-            Write-Error "Updating the SSLVPN certificate failed: $($out.Error)"
-        }
-        $out = Invoke-SSHCommand -SessionId $session.sessionid "config vpn ssl settings
-        set servercert `"LetsEncrypt`"
-        end
-        "
-        if($out.ExitStatus -ne 0){
-            Write-Error "Updating the SSLVPN certificate failed: $($out.Error)"
-        }
-
-        # Disconnect Session
-        if(Remove-SSHSession -SessionId $session.sessionid){
-            Write-Output "Finished!"
-        }
-    }
 }else{
     Write-Output "No need to update certificate!"
 }
